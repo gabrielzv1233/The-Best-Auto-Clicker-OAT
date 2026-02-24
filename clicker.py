@@ -1,14 +1,9 @@
 from logging.handlers import RotatingFileHandler
-
 from rich.logging import RichHandler
-
 import ctypes.wintypes as wintypes
-
 from pathlib import Path
 from tkinter import ttk
-
 import tkinter as tk
-
 import subprocess
 import threading
 import keyboard
@@ -23,8 +18,7 @@ import sys
 import os
 import re
 
-
-DEBUG_MODE = False
+DEBUG_MODE = True
 TRACE_HOTKEY_EVENTS = False
 TRACE_CLICK_EVENTS = False
 
@@ -132,6 +126,7 @@ def default_config():
         "interval_milliseconds": "100",
         "output_mode": "mouse",
         "mouse_button": "left",
+        "lock_cursor": False,
         "output_key": default_bind(),
         "toggle_mode": "press",
         "start_bind": default_bind(),
@@ -372,6 +367,17 @@ class WinInput:
         return int(vk)
 
     @staticmethod
+    def get_cursor_pos():
+        pt = WinFocus.POINT()
+        if not WinInput.user32.GetCursorPos(ctypes.byref(pt)):
+            return None
+        return int(pt.x), int(pt.y)
+
+    @staticmethod
+    def set_cursor_pos(x, y):
+        return bool(WinInput.user32.SetCursorPos(int(x), int(y)))
+
+    @staticmethod
     def send_key(scan_code, is_keyup=False):
         raw, scan, extended = WinInput._normalize_scan(scan_code)
         flags = KEYEVENTF_SCANCODE
@@ -462,6 +468,9 @@ class ClickerWorker:
 
         self._blocked_last = None
         self._variance_tick_s = 0.25
+        self._cursor_lock_anchor = None
+        self._cursor_lock_interval_s = 0.05
+        self._cursor_lock_next_t = 0.0
 
         self.thread = threading.Thread(target=self._loop, name="clicker-worker", daemon=True)
         self.thread.start()
@@ -471,6 +480,8 @@ class ClickerWorker:
         logger.debug("ClickerWorker closing")
         self.shutdown_event.set()
         self.active_event.clear()
+        self._cursor_lock_anchor = None
+        self._cursor_lock_next_t = 0.0
         self.nudge_event.set()
         self.thread.join(timeout=2)
         logger.debug("ClickerWorker closed")
@@ -487,6 +498,8 @@ class ClickerWorker:
             self._current_cps = None
             self._next_cps_update_t = 0.0
             self._blocked_last = None
+            self._cursor_lock_anchor = WinInput.get_cursor_pos()
+            self._cursor_lock_next_t = time.perf_counter() + self._cursor_lock_interval_s
         else:
             self.active_event.clear()
             self.ui_queue.put(("status", "Stopped", "stopped"))
@@ -494,6 +507,8 @@ class ClickerWorker:
             self._current_cps = None
             self._next_cps_update_t = 0.0
             self._blocked_last = None
+            self._cursor_lock_anchor = None
+            self._cursor_lock_next_t = 0.0
         self.nudge_event.set()
 
     def toggle_active(self):
@@ -502,7 +517,28 @@ class ClickerWorker:
         else:
             self.set_active(True, "toggle bind")
 
-    def _sleep_interruptible(self, seconds_value):
+    def _should_lock_cursor(self, runtime):
+        return bool(
+            runtime.get("output_mode") == "mouse"
+            and runtime.get("lock_cursor")
+            and self._cursor_lock_anchor is not None
+        )
+
+    def _lock_cursor_if_due(self, runtime, now=None):
+        if not self._should_lock_cursor(runtime):
+            return
+
+        if now is None:
+            now = time.perf_counter()
+
+        if now < self._cursor_lock_next_t:
+            return
+
+        x, y = self._cursor_lock_anchor
+        WinInput.set_cursor_pos(x, y)
+        self._cursor_lock_next_t = now + self._cursor_lock_interval_s
+
+    def _sleep_interruptible(self, seconds_value, runtime=None):
         delay = max(0.0, float(seconds_value))
         if delay <= 0:
             return
@@ -513,24 +549,41 @@ class ClickerWorker:
             if not self.active_event.is_set():
                 return
 
-            remaining = target - time.perf_counter()
+            now = time.perf_counter()
+            if runtime is not None:
+                self._lock_cursor_if_due(runtime, now)
+
+            remaining = target - now
             if remaining <= 0:
                 return
+
+            sleep_window = remaining
+            if runtime is not None and self._should_lock_cursor(runtime):
+                until_lock = self._cursor_lock_next_t - now
+                if until_lock <= 0:
+                    continue
+                sleep_window = min(sleep_window, until_lock)
 
             if self.nudge_event.is_set():
                 self.nudge_event.clear()
 
-            if remaining > 0.003:
-                time.sleep(remaining - 0.0015)
+            if sleep_window > 0.003:
+                time.sleep(sleep_window - 0.0015)
                 continue
 
+            spin_target = now + max(0.0, sleep_window)
             while not self.shutdown_event.is_set():
                 if not self.active_event.is_set():
                     return
                 if self.nudge_event.is_set():
                     self.nudge_event.clear()
-                if time.perf_counter() >= target:
+                spin_now = time.perf_counter()
+                if runtime is not None:
+                    self._lock_cursor_if_due(runtime, spin_now)
+                if spin_now >= target:
                     return
+                if spin_now >= spin_target:
+                    break
                 time.sleep(0)
 
     def _loop(self):
@@ -541,6 +594,7 @@ class ClickerWorker:
             if not self.active_event.wait(timeout=0.1):
                 next_t = None
                 self._blocked_last = None
+                self._cursor_lock_next_t = 0.0
                 continue
 
             if self.runtime_cache is None or self.runtime_dirty.is_set():
@@ -555,14 +609,19 @@ class ClickerWorker:
                     self._current_cps = None
                     self._next_cps_update_t = 0.0
                     self._blocked_last = None
+                    self._cursor_lock_anchor = None
+                    self._cursor_lock_next_t = 0.0
                     continue
                 self.runtime_cache = runtime
                 next_t = None
                 self._current_cps = None
                 self._next_cps_update_t = 0.0
                 self._blocked_last = None
+                self._cursor_lock_next_t = 0.0
             else:
                 runtime = self.runtime_cache
+
+            self._lock_cursor_if_due(runtime)
 
             blocked = False
             if self.block_click_check is not None and self.block_click_check():
@@ -572,7 +631,7 @@ class ClickerWorker:
                 if self._blocked_last is not True:
                     self.ui_queue.put(("status", "Running (blocked: cursor in app)", "running"))
                     self._blocked_last = True
-                self._sleep_interruptible(0.02)
+                self._sleep_interruptible(0.02, runtime)
                 next_t = None
                 self._current_cps = None
                 self._next_cps_update_t = 0.0
@@ -616,7 +675,7 @@ class ClickerWorker:
                 period = float(runtime["interval_seconds"])
 
             if now < next_t:
-                self._sleep_interruptible(next_t - now)
+                self._sleep_interruptible(next_t - now, runtime)
                 continue
 
             if runtime["output_mode"] == "mouse":
@@ -632,6 +691,8 @@ class ClickerWorker:
                 self._current_cps = None
                 self._next_cps_update_t = 0.0
                 self._blocked_last = None
+                self._cursor_lock_anchor = None
+                self._cursor_lock_next_t = 0.0
                 continue
 
             next_t += period
@@ -1098,9 +1159,9 @@ class AutoClickerApp:
 
         self.mouse_row = ttk.Frame(output_frame)
         self.mouse_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
-        self.mouse_row.columnconfigure(1, weight=1)
+        self.mouse_row.columnconfigure(3, weight=1)
 
-        ttk.Label(self.mouse_row, text="Mouse Button").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.mouse_row, text="Button").grid(row=0, column=0, sticky="w")
         self.vars["mouse_button"] = tk.StringVar()
         self.mouse_button_combo = ttk.Combobox(
             self.mouse_row,
@@ -1111,6 +1172,11 @@ class AutoClickerApp:
         )
         self.mouse_button_combo.grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.mouse_button_combo.bind("<<ComboboxSelected>>", lambda e: self._on_any_ui_change())
+
+        self.vars["lock_cursor"] = tk.BooleanVar(value=False)
+        self.lock_cursor_check = ttk.Checkbutton(self.mouse_row, text="Cursor Lock", variable=self.vars["lock_cursor"])
+        self.lock_cursor_check.grid(row=0, column=2, sticky="w", padx=(12, 0))
+        HoverTip(self.lock_cursor_check, "Lock Cursor in place while enabled")
 
         self.keyboard_row = ttk.Frame(output_frame)
         self.keyboard_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
@@ -1207,6 +1273,7 @@ class AutoClickerApp:
             "cps_mode",
             "output_mode",
             "mouse_button",
+            "lock_cursor",
             "toggle_mode",
         ]:
             self.vars[key].trace_add("write", self._on_var_trace)
@@ -1247,6 +1314,7 @@ class AutoClickerApp:
                 self.vars[key].set(str(cfg.get(key, "")))
 
         self.vars["elevate_on_start"].set(bool(cfg.get("elevate_on_start", False)))
+        self.vars["lock_cursor"].set(bool(cfg.get("lock_cursor", False)))
 
         self._trace_guard = False
         self._refresh_bind_buttons()
@@ -1285,6 +1353,7 @@ class AutoClickerApp:
                 self.config[key] = self.vars[key].get()
 
             self.config["elevate_on_start"] = bool(self.vars["elevate_on_start"].get())
+            self.config["lock_cursor"] = bool(self.vars["lock_cursor"].get())
 
     def _set_bind(self, target_key, bind_data):
         with self.config_lock:
@@ -1335,11 +1404,13 @@ class AutoClickerApp:
             self.mouse_row.grid()
             self.keyboard_row.grid_remove()
             self.mouse_button_combo.configure(state="readonly")
+            self.lock_cursor_check.configure(state="normal")
             self.capture_output_button.configure(state="normal")
         else:
             self.mouse_row.grid_remove()
             self.keyboard_row.grid()
             self.mouse_button_combo.configure(state="disabled")
+            self.lock_cursor_check.configure(state="disabled")
             self.capture_output_button.configure(state="normal")
 
     def _parse_float(self, text_value, field_name, minimum=None):
@@ -1404,6 +1475,7 @@ class AutoClickerApp:
                 "static_variance": variance,
                 "output_mode": cfg.get("output_mode"),
                 "mouse_button": cfg.get("mouse_button"),
+                "lock_cursor": bool(cfg.get("lock_cursor", False)),
                 "output_key": output_key,
                 "toggle_mode": cfg.get("toggle_mode"),
                 "start_bind": start_bind,
@@ -1433,6 +1505,7 @@ class AutoClickerApp:
             "interval_seconds": interval_seconds,
             "output_mode": cfg.get("output_mode"),
             "mouse_button": cfg.get("mouse_button"),
+            "lock_cursor": bool(cfg.get("lock_cursor", False)),
             "output_key": output_key,
             "toggle_mode": cfg.get("toggle_mode"),
             "start_bind": start_bind,
