@@ -726,10 +726,23 @@ class AutoClickerApp:
 
         logger.info("Relaunching elevated | exe=%s | params=%s", exe, params)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+
         if rc <= 32:
-            raise RuntimeError(f"ShellExecuteW runas failed (rc={rc})")
+            logger.warning("Elevation cancelled or failed | rc=%s", rc)
+
+            with self.config_lock:
+                self.config["elevate_on_start"] = False
+            self._save_config()
+
+            self.vars["elevate_on_start"].set(False)
+            self._set_elevation_ui()
+            self._set_status("Elevation cancelled", "warn")
+            self._sync_footer_status()
+
+            return False
 
         self.root.after(50, self._on_close)
+        return True
 
     def _set_elevation_ui(self):
         elevated = self._is_elevated()
@@ -751,12 +764,7 @@ class AutoClickerApp:
             self._set_status("Requesting admin (UAC)...", "info")
             self._sync_footer_status()
             self.root.update_idletasks()
-            try:
-                self._restart_elevated()
-            except Exception as e:
-                logger.exception("Elevation relaunch failed")
-                self._set_status(f"Elevation failed: {e}", "error")
-                self._sync_footer_status()
+            self._restart_elevated()
             return
 
         if not want:
@@ -1691,9 +1699,18 @@ def main():
 
         logger.info("Elevate-on-start enabled; requesting UAC relaunch")
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+
         if rc <= 32:
-            raise RuntimeError(f"ShellExecuteW runas failed (rc={rc})")
-        return None, None
+            logger.warning("Elevation refused/cancelled | rc=%s | disabling elevate_on_start", rc)
+            try:
+                cfg["elevate_on_start"] = False
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+            except Exception:
+                logger.exception("Failed to update config after elevation refusal")
+
+        else:
+            return None, None
 
     WinTimer.begin(1)
 
@@ -1704,13 +1721,16 @@ def main():
 if __name__ == "__main__":
     root = None
     app = None
+    timer_started = False
     try:
         root, app = main()
         if root is not None:
+            timer_started = True
             root.mainloop()
     except KeyboardInterrupt:
         logger.info("Interrupted by user, exiting")
         if app is not None:
             app._on_close()
     finally:
-        WinTimer.end(1)
+        if timer_started:
+            WinTimer.end(1)
