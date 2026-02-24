@@ -259,13 +259,38 @@ class WinInput:
 
     @staticmethod
     def _send_many(inputs):
+        if not inputs:
+            return True
+
         arr_type = INPUT * len(inputs)
         arr = arr_type(*inputs)
-        sent = WinInput.user32.SendInput(len(inputs), ctypes.byref(arr), ctypes.sizeof(INPUT))
-        if sent != len(inputs):
+
+        total = len(inputs)
+        sent_total = 0
+
+        for _ in range(3):
+            remaining = total - sent_total
+            if remaining <= 0:
+                return True
+
+            slice_type = INPUT * remaining
+            slice_arr = slice_type(*arr[sent_total:])
+
+            sent = WinInput.user32.SendInput(remaining, ctypes.byref(slice_arr), ctypes.sizeof(INPUT))
+            if sent <= 0:
+                last_error = ctypes.get_last_error()
+                logger.error("SendInput batch failed | sent=0/%s | last_error=%s", remaining, last_error)
+            else:
+                sent_total += int(sent)
+
+            if sent_total < total:
+                time.sleep(0)
+
+        if sent_total != total:
             last_error = ctypes.get_last_error()
-            logger.error("SendInput batch failed | sent=%s/%s | last_error=%s", sent, len(inputs), last_error)
+            logger.error("SendInput batch incomplete | sent=%s/%s | last_error=%s", sent_total, total, last_error)
             return False
+
         return True
 
     @staticmethod
@@ -340,9 +365,14 @@ class WinInput:
         inp_up.type = INPUT_MOUSE
         inp_up.mi = MOUSEINPUT(0, 0, 0, up_flag, 0, 0)
 
-        return WinInput._send_many([inp_down, inp_up])
+        ok = WinInput._send_many([inp_down, inp_up])
+        if ok:
+            return True
 
-
+        logger.warning("Click send failed; attempting forced mouse-up release")
+        WinInput._send(inp_up)
+        return False
+    
 class ClickerWorker:
     def __init__(self, config_getter, ui_queue_ref, block_click_check=None):
         self.config_getter = config_getter
@@ -1274,7 +1304,7 @@ class AutoClickerApp:
     def _capture_key_thread(self, target_key):
         try:
             while True:
-                event = keyboard.read_event(suppress=True)
+                event = keyboard.read_event(suppress=False)
                 if getattr(event, "event_type", None) != "down":
                     continue
 
