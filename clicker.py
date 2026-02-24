@@ -1,9 +1,15 @@
 from logging.handlers import RotatingFileHandler
+
 from rich.logging import RichHandler
+
 import ctypes.wintypes as wintypes
+
 from pathlib import Path
 from tkinter import ttk
+
 import tkinter as tk
+
+import subprocess
 import threading
 import keyboard
 import logging
@@ -13,8 +19,10 @@ import queue
 import time
 import copy
 import json
+import sys
 import os
 import re
+
 
 DEBUG_MODE = False
 TRACE_HOTKEY_EVENTS = False
@@ -128,12 +136,11 @@ def default_config():
         "toggle_mode": "press",
         "start_bind": default_bind(),
         "stop_bind": default_bind(),
+        "elevate_on_start": False,
     }
 
 
 def read_windows_app_theme():
-    # Windows setting: Settings -> Personalization -> Colors -> "Choose your mode"
-    # Registry: AppsUseLightTheme (1=light, 0=dark)
     try:
         import winreg
 
@@ -144,6 +151,63 @@ def read_windows_app_theme():
     except Exception as e:
         logger.debug("Theme read failed, defaulting to dark | %s", e)
         return "dark"
+
+
+class HoverTip:
+    def __init__(self, widget, text, delay_ms=450):
+        self.widget = widget
+        self.text = str(text)
+        self.delay_ms = int(delay_ms)
+        self._after_id = None
+        self.tip = None
+
+        self.widget.bind("<Enter>", self._on_enter, add="+")
+        self.widget.bind("<Leave>", self._on_leave, add="+")
+        self.widget.bind("<ButtonPress>", self._on_leave, add="+")
+
+    def _on_enter(self, _e=None):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _on_leave(self, _e=None):
+        self._cancel()
+        self._hide()
+
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception as e:
+                logger.debug("after_cancel failed: %s", e)
+            self._after_id = None
+
+    def _show(self):
+        if self.tip is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 10
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        except Exception:
+            return
+
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+
+        bg = "#111111"
+        fg = "#f2f2f2"
+
+        lbl = tk.Label(self.tip, text=self.text, justify="left", bg=bg, fg=fg, padx=10, pady=8)
+        lbl.pack()
+
+    def _hide(self):
+        if self.tip is not None:
+            try:
+                self.tip.destroy()
+            except Exception as e:
+                logger.debug("tooltip destroy failed: %s", e)
+            self.tip = None
+
 
 class WinFocus:
     user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -189,7 +253,7 @@ class WinTimer:
             logger.exception("timeBeginPeriod failed")
 
     @staticmethod
-    def     end(period_ms=1):
+    def end(period_ms=1):
         try:
             result = WinTimer.winmm.timeEndPeriod(int(period_ms))
             if result != 0:
@@ -337,10 +401,15 @@ class WinInput:
 
         inp_up = INPUT()
         inp_up.type = INPUT_KEYBOARD
-        inp_up.type = INPUT_KEYBOARD
         inp_up.ki = KEYBDINPUT(0, scan, flags_up, 0, 0)
 
-        return WinInput._send_many([inp_down, inp_up])
+        ok = WinInput._send_many([inp_down, inp_up])
+        if ok:
+            return True
+
+        logger.warning("Key tap send failed; attempting forced key-up release")
+        WinInput._send(inp_up)
+        return False
 
     @staticmethod
     def click_mouse(button_name):
@@ -372,7 +441,8 @@ class WinInput:
         logger.warning("Click send failed; attempting forced mouse-up release")
         WinInput._send(inp_up)
         return False
-    
+
+
 class ClickerWorker:
     def __init__(self, config_getter, ui_queue_ref, block_click_check=None):
         self.config_getter = config_getter
@@ -413,14 +483,14 @@ class ClickerWorker:
         if active:
             self.active_event.set()
             self.ui_queue.put(("status", f"Running ({reason})", "running"))
-            logger.debug("Clicker started | [yellow]reason[/yellow]=[magenta]%s[/magenta]", reason)
+            logger.debug("Clicker started | reason=%s", reason)
             self._current_cps = None
             self._next_cps_update_t = 0.0
             self._blocked_last = None
         else:
             self.active_event.clear()
             self.ui_queue.put(("status", "Stopped", "stopped"))
-            logger.debug("Clicker stopped | [yellow]reason[/yellow]=[magenta]%s[/magenta]", reason)
+            logger.debug("Clicker stopped | reason=%s", reason)
             self._current_cps = None
             self._next_cps_update_t = 0.0
             self._blocked_last = None
@@ -637,6 +707,66 @@ class AutoClickerApp:
 
         logger.debug("UI initialized")
 
+    def _is_elevated(self):
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception as e:
+            logger.debug("IsUserAnAdmin failed: %s", e)
+            return False
+
+    def _restart_elevated(self):
+        exe = sys.executable
+
+        if getattr(sys, "frozen", False):
+            args = sys.argv[1:]
+        else:
+            args = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+
+        params = subprocess.list2cmdline(args)
+
+        logger.info("Relaunching elevated | exe=%s | params=%s", exe, params)
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        if rc <= 32:
+            raise RuntimeError(f"ShellExecuteW runas failed (rc={rc})")
+
+        self.root.after(50, self._on_close)
+
+    def _set_elevation_ui(self):
+        elevated = self._is_elevated()
+        if elevated:
+            self.elev_state_var.set("Elevated")
+            self.elev_state_label.configure(style="ElevatedOk.TLabel")
+        else:
+            self.elev_state_var.set("Not elevated")
+            self.elev_state_label.configure(style="ElevatedNo.TLabel")
+
+    def _on_elevate_toggle(self):
+        want = bool(self.vars["elevate_on_start"].get())
+
+        with self.config_lock:
+            self.config["elevate_on_start"] = want
+        self._save_config()
+
+        if want and not self._is_elevated():
+            self._set_status("Requesting admin (UAC)...", "info")
+            self._sync_footer_status()
+            self.root.update_idletasks()
+            try:
+                self._restart_elevated()
+            except Exception as e:
+                logger.exception("Elevation relaunch failed")
+                self._set_status(f"Elevation failed: {e}", "error")
+                self._sync_footer_status()
+            return
+
+        if not want:
+            self._set_status("Elevate on start: OFF", "info")
+        else:
+            self._set_status("Elevate on start: ON", "info")
+
+        self._set_elevation_ui()
+        self._sync_footer_status()
+
     def _load_config(self):
         cfg = default_config()
         try:
@@ -689,8 +819,10 @@ class AutoClickerApp:
             theme_mode = UI_THEME_MODE
         else:
             theme_mode = "dark"
+
         if not force and theme_mode == self.current_theme_mode:
             return
+
         self.current_theme_mode = theme_mode
         logger.info("Applying UI theme: %s", theme_mode)
 
@@ -740,6 +872,13 @@ class AutoClickerApp:
 
         self.colors = c
         self.root.configure(bg=c["bg"])
+        
+        self.style.configure("TCheckbutton", background=c["bg"], foreground=c["text"])
+        self.style.map(
+            "TCheckbutton",
+            background=[("active", c["bg"]), ("pressed", c["bg"])],
+            foreground=[("disabled", c["muted"]), ("active", c["text"])],
+        )
 
         self.style.configure(".", background=c["bg"], foreground=c["text"])
         self.style.configure("TFrame", background=c["bg"])
@@ -833,6 +972,14 @@ class AutoClickerApp:
         self.style.configure("StatusRunning.TLabel", background=c["bg"], foreground=c["ok"])
         self.style.configure("StatusStopped.TLabel", background=c["bg"], foreground=c["muted"])
         self.style.configure("StatusError.TLabel", background=c["bg"], foreground=c["err"])
+
+        self.style.configure("ElevatedOk.TLabel", background=c["bg"], foreground=c["ok"])
+        self.style.configure("ElevatedNo.TLabel", background=c["bg"], foreground=c["muted"])
+
+        try:
+            self._set_elevation_ui()
+        except Exception as e:
+            logger.debug("Elevation UI update failed: %s", e)
 
     def _build_ui(self):
         self.root.configure(padx=12, pady=12)
@@ -1009,11 +1156,35 @@ class AutoClickerApp:
         footer = ttk.Frame(content_col)
         footer.grid(row=4, column=0, sticky="ew", pady=(2, 0))
         footer.columnconfigure(0, weight=1)
+        footer.columnconfigure(1, weight=0)
 
         self.status_label = ttk.Label(footer, textvariable=self.footer_status_var, style="StatusStopped.TLabel")
         self.status_label.grid(row=0, column=0, sticky="w")
 
-        # Right-click to clear binds
+        right = ttk.Frame(footer)
+        right.grid(row=0, column=1, sticky="e")
+
+        self.vars["elevate_on_start"] = tk.BooleanVar(value=False)
+
+        self.elev_state_var = tk.StringVar(value="")
+        self.elev_state_label = ttk.Label(right, textvariable=self.elev_state_var, style="ElevatedNo.TLabel")
+        self.elev_state_label.grid(row=0, column=0, sticky="e", padx=(0, 10))
+
+        elev_cb = ttk.Checkbutton(
+            right,
+            text="Elevate",
+            variable=self.vars["elevate_on_start"],
+            command=self._on_elevate_toggle,
+        )
+        elev_cb.grid(row=0, column=1, sticky="e")
+
+        HoverTip(
+            elev_cb,
+            "Elevation helps in some apps (like games) where synthetic inputs or global key hooks\n"
+            "get ignored or behave weird. Turning this ON will prompt UAC and relaunch as admin.\n"
+            "Turning it OFF stops asking on launch (it will not de-elevate the current process).",
+        )
+
         self.start_bind_button.bind("<Button-3>", lambda e: self._clear_bind("start_bind"))
         self.stop_bind_button.bind("<Button-3>", lambda e: self._clear_bind("stop_bind"))
         self.capture_output_button.bind("<Button-3>", lambda e: self._clear_bind("output_key"))
@@ -1067,8 +1238,15 @@ class AutoClickerApp:
             if key in self.vars:
                 self.vars[key].set(str(cfg.get(key, "")))
 
+        self.vars["elevate_on_start"].set(bool(cfg.get("elevate_on_start", False)))
+
         self._trace_guard = False
         self._refresh_bind_buttons()
+
+        try:
+            self._set_elevation_ui()
+        except Exception as e:
+            logger.debug("Elevation UI update failed: %s", e)
 
     def _on_var_trace(self, *args):
         self._on_any_ui_change()
@@ -1097,6 +1275,8 @@ class AutoClickerApp:
                 "toggle_mode",
             ]:
                 self.config[key] = self.vars[key].get()
+
+            self.config["elevate_on_start"] = bool(self.vars["elevate_on_start"].get())
 
     def _set_bind(self, target_key, bind_data):
         with self.config_lock:
@@ -1482,17 +1662,52 @@ class AutoClickerApp:
 
 def main():
     logger.info("Launching %s", APP_NAME)
+
+    cfg = default_config()
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if CONFIG_PATH.exists():
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                for k, v in loaded.items():
+                    if k in cfg:
+                        cfg[k] = v
+    except Exception as e:
+        logger.debug("Startup config read failed: %s", e)
+
+    want_elev = bool(cfg.get("elevate_on_start", False))
+    try:
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        is_admin = False
+
+    if want_elev and not is_admin:
+        exe = sys.executable
+        if getattr(sys, "frozen", False):
+            args = sys.argv[1:]
+        else:
+            args = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+        params = subprocess.list2cmdline(args)
+
+        logger.info("Elevate-on-start enabled; requesting UAC relaunch")
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        if rc <= 32:
+            raise RuntimeError(f"ShellExecuteW runas failed (rc={rc})")
+        return None, None
+
     WinTimer.begin(1)
 
     root = tk.Tk()
     return root, AutoClickerApp(root)
+
 
 if __name__ == "__main__":
     root = None
     app = None
     try:
         root, app = main()
-        root.mainloop()
+        if root is not None:
+            root.mainloop()
     except KeyboardInterrupt:
         logger.info("Interrupted by user, exiting")
         if app is not None:
