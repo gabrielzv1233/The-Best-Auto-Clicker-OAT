@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "The Best Auto Clicker OAT"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Gabrielzv1233"
 #define MyAppURL "https://github.com/gabrielzv1233/The-Best-Auto-Clicker-OAT"
 #define MyAppExeName "TheBestAutoClickerOAT.exe"
