@@ -142,8 +142,7 @@ def read_windows_app_theme():
             apps_use_light, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
         return "light" if int(apps_use_light) == 1 else "dark"
     except Exception as e:
-        if DEBUG_MODE:
-            logger.debug("Theme read failed, defaulting to dark | %s", e)
+        logger.debug("Theme read failed, defaulting to dark | %s", e)
         return "dark"
 
 class WinFocus:
@@ -384,14 +383,14 @@ class ClickerWorker:
         if active:
             self.active_event.set()
             self.ui_queue.put(("status", f"Running ({reason})", "running"))
-            logger.info("Clicker started | reason=%s", reason)
+            logger.debug("Clicker started | [yellow]reason[/yellow]=[magenta]%s[/magenta]", reason)
             self._current_cps = None
             self._next_cps_update_t = 0.0
             self._blocked_last = None
         else:
             self.active_event.clear()
             self.ui_queue.put(("status", "Stopped", "stopped"))
-            logger.info("Clicker stopped | reason=%s", reason)
+            logger.debug("Clicker stopped | [yellow]reason[/yellow]=[magenta]%s[/magenta]", reason)
             self._current_cps = None
             self._next_cps_update_t = 0.0
             self._blocked_last = None
@@ -508,8 +507,7 @@ class ClickerWorker:
 
                     self._next_cps_update_t = now + self._variance_tick_s
 
-                    if DEBUG_MODE:
-                        logger.debug("CPS target now: %.3f (base=%.3f var=%.3f)", float(self._current_cps), base, var)
+                    logger.debug("CPS target now: %.3f (base=%.3f var=%.3f)", float(self._current_cps), base, var)
 
                 period = 1.0 / max(0.001, float(self._current_cps))
             else:
@@ -561,6 +559,7 @@ class AutoClickerApp:
         self.capture_target = None
         self.capture_threads = {}
         self.current_theme_mode = None
+        self.text_input_focused = threading.Event()
 
         self.style = ttk.Style(self.root)
         self._apply_theme(force=True)
@@ -642,8 +641,7 @@ class AutoClickerApp:
             temp_path = CONFIG_PATH.with_suffix(".tmp")
             temp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
             temp_path.replace(CONFIG_PATH)
-            if DEBUG_MODE:
-                logger.debug("Config saved")
+            logger.debug("Config saved")
         except Exception:
             logger.exception("Failed to save config")
 
@@ -879,6 +877,18 @@ class AutoClickerApp:
         self.vars["interval_milliseconds"] = tk.StringVar()
         self.interval_ms_entry = ttk.Entry(self.interval_row, textvariable=self.vars["interval_milliseconds"], width=6)
         self.interval_ms_entry.grid(row=0, column=7, sticky="ew", padx=(4, 0))
+
+        self.text_input_widgets = [
+            self.static_cps_entry,
+            self.static_var_entry,
+            self.interval_hours_entry,
+            self.interval_minutes_entry,
+            self.interval_seconds_entry,
+            self.interval_ms_entry,
+        ]
+        for widget in self.text_input_widgets:
+            widget.bind("<FocusIn>", self._on_text_input_focus_in, add="+")
+            widget.bind("<FocusOut>", self._on_text_input_focus_out, add="+")
 
         output_frame = ttk.Frame(content_col, style="Section.TFrame")
         output_frame.grid(row=1, column=0, sticky="ew", pady=section_pad)
@@ -1334,6 +1344,27 @@ class AutoClickerApp:
 
         self.root.after(50, self._drain_ui_queue)
 
+    def _on_text_input_focus_in(self, _event=None):
+        self.text_input_focused.set()
+
+    def _on_text_input_focus_out(self, _event=None):
+        self.root.after_idle(self._refresh_text_input_focus_state)
+
+    def _refresh_text_input_focus_state(self):
+        focused_widget = self.root.focus_get()
+        if focused_widget is None:
+            self.text_input_focused.clear()
+            return
+        try:
+            widget_class = str(focused_widget.winfo_class())
+        except Exception:
+            self.text_input_focused.clear()
+            return
+        if widget_class in ("Entry", "TEntry", "Spinbox", "Text"):
+            self.text_input_focused.set()
+        else:
+            self.text_input_focused.clear()
+
     def _on_keyboard_event(self, event):
         with self.capture_lock:
             if self.capture_target is not None:
@@ -1379,6 +1410,15 @@ class AutoClickerApp:
             return
 
         if start_scan is None or scan_code != int(start_scan):
+            return
+
+        ignore_start_for_window = is_down and WinFocus.is_cursor_in_window(self.hwnd)
+        ignore_start_for_text_input = is_down and self.text_input_focused.is_set()
+        if ignore_start_for_window or ignore_start_for_text_input:
+            if ignore_start_for_text_input:
+                logger.debug("Start hotkey ignored (text input focused)")
+            else:
+                logger.debug("Start hotkey ignored (app in foreground and cursor inside window)")
             return
 
         if toggle_mode == "press":
