@@ -1,3 +1,12 @@
-pyinstaller
+comtypes
 keyboard
+markdown-it-py
+mdurl
+Nuitka
+ordered-set
+pillow
+psutil
+Pygments
+pywin32
 rich
+zstandard

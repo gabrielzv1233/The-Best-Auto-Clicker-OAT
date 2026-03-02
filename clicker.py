@@ -18,11 +18,11 @@ import sys
 import os
 import re
 
-DEBUG_MODE = True
+DEBUG_MODE = None
 TRACE_HOTKEY_EVENTS = False
 TRACE_CLICK_EVENTS = False
 
-LOG_TO_FILE = True
+LOG_TO_FILE = False
 LOG_FILE_MAX_BYTES = 1_000_000
 LOG_FILE_BACKUPS = 3
 
@@ -50,6 +50,8 @@ MOUSEEVENTF_MIDDLEUP = 0x0040
 
 MAPVK_VSC_TO_VK_EX = 3
 
+if DEBUG_MODE is None:
+    DEBUG_MODE = not getattr(sys, "frozen", False)
 
 def setup_logger():
     logger = logging.getLogger("autoclicker")
@@ -96,8 +98,8 @@ def setup_logger():
     logger.info("%s logger initialized | DEBUG_MODE=%s", APP_NAME, DEBUG_MODE)
     return logger
 
-
 logger = setup_logger()
+
 
 if hasattr(wintypes, "ULONG_PTR"):
     ULONG_PTR = wintypes.ULONG_PTR
@@ -133,6 +135,27 @@ def default_config():
         "stop_bind": default_bind(),
         "elevate_on_start": False,
     }
+
+
+def current_process_exe():
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetModuleFileNameW(None, buf, len(buf))
+        if n:
+            return str(buf.value)
+    except Exception as e:
+        logger.debug("GetModuleFileNameW failed, falling back to argv[0] | %s", e)
+    return os.path.abspath(sys.argv[0])
+
+
+def self_launch_command():
+    if bool(getattr(sys, "frozen", False) or ("__compiled__" in globals())):
+        exe = current_process_exe()
+        args = sys.argv[1:]
+    else:
+        exe = sys.executable
+        args = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+    return exe, args
 
 
 def read_windows_app_theme():
@@ -494,7 +517,7 @@ class ClickerWorker:
         if active:
             self.active_event.set()
             self.ui_queue.put(("status", f"Running ({reason})", "running"))
-            logger.debug("Clicker started | reason=%s", reason)
+            logger.debug("Clicker [green]started[/green]\t| reason=%s", reason.replace(" ", "_"))
             self._current_cps = None
             self._next_cps_update_t = 0.0
             self._blocked_last = None
@@ -503,7 +526,7 @@ class ClickerWorker:
         else:
             self.active_event.clear()
             self.ui_queue.put(("status", "Stopped", "stopped"))
-            logger.debug("Clicker stopped | reason=%s", reason)
+            logger.debug("Clicker [red]stopped[/red]\t| reason=%s", reason.replace(" ", "_") )
             self._current_cps = None
             self._next_cps_update_t = 0.0
             self._blocked_last = None
@@ -694,6 +717,12 @@ class ClickerWorker:
                 self._cursor_lock_anchor = None
                 self._cursor_lock_next_t = 0.0
                 continue
+            
+            else:
+                if runtime["output_mode"] == "mouse":
+                    logger.debug("[i]Input sent [/i]| mouse=%s |", runtime["mouse_button"])    
+                else:
+                    logger.debug("[i]Input sent [/i]| key=%s |", hex(runtime["output_key"]["scan_code"]))
 
             next_t += period
 
@@ -776,20 +805,21 @@ class AutoClickerApp:
             return False
 
     def _restart_elevated(self):
-        exe = sys.executable
-
-        if getattr(sys, "frozen", False):
-            args = sys.argv[1:]
-        else:
-            args = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+        exe, args = self_launch_command()
 
         params = subprocess.list2cmdline(args)
 
         logger.info("Relaunching elevated | exe=%s | params=%s", exe, params)
+        ctypes.set_last_error(0)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
 
         if rc <= 32:
-            logger.warning("Elevation cancelled or failed | rc=%s", rc)
+            logger.warning(
+                "Elevation cancelled or failed | rc=%s | last_error=%s | exe_exists=%s",
+                rc,
+                ctypes.get_last_error(),
+                os.path.exists(exe),
+            )
 
             with self.config_lock:
                 self.config["elevate_on_start"] = False
@@ -1679,7 +1709,7 @@ class AutoClickerApp:
 
         if TRACE_HOTKEY_EVENTS and DEBUG_MODE:
             logger.debug(
-                "Hotkey event | type=%s | scan=0x%X | start=%s | stop=%s | mode=%s",
+                "Hotkey event\t| type=%s\t| scan=0x%X\t| start=%s\t| stop=%s\t| mode=%s",
                 event_type,
                 scan_code,
                 None if start_scan is None else f"0x{int(start_scan):X}",
@@ -1763,18 +1793,20 @@ def main():
         is_admin = False
 
     if want_elev and not is_admin:
-        exe = sys.executable
-        if getattr(sys, "frozen", False):
-            args = sys.argv[1:]
-        else:
-            args = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+        exe, args = self_launch_command()
         params = subprocess.list2cmdline(args)
 
         logger.info("Elevate-on-start enabled; requesting UAC relaunch")
+        ctypes.set_last_error(0)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
 
         if rc <= 32:
-            logger.warning("Elevation refused/cancelled | rc=%s | disabling elevate_on_start", rc)
+            logger.warning(
+                "Elevation refused/cancelled | rc=%s | last_error=%s | exe_exists=%s | disabling elevate_on_start",
+                rc,
+                ctypes.get_last_error(),
+                os.path.exists(exe),
+            )
             try:
                 cfg["elevate_on_start"] = False
                 CONFIG_DIR.mkdir(parents=True, exist_ok=True)

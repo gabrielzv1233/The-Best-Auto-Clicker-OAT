@@ -10,10 +10,15 @@ Has all the features you could ask for:
 
 > ## For developers
 >
-> script should be compiled using the following command:
+> script can be compiled with the helper script:
 >
 > ```bash
-> pyinstaller clicker.py --onefile --noconsole -n=TheBestAutoClickerOAT
+> python compile_nuitka.py
 > ```
+>
+> it hashes an existing exe, runs Nuitka, captures output to `build/nuitka-build.log`,
+> and verifies the output exe changed.
+>
+> (or use `pyinstaller clicker.py --onefile --noconsole -n=TheBestAutoClickerOAT` if using pyinstaller)
 >
 > Additionally you can compile an installer using [Inno Setup](https://jrsoftware.org/isinfo.php) and `TheBestAutoClickerOAT.iss`
